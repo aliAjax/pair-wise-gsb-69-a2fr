@@ -3,6 +3,7 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  effect,
   inject,
   signal,
 } from '@angular/core';
@@ -19,11 +20,15 @@ import {
   ChangeRequest,
   ChangeStep,
   DeviationRecord,
+  ImpactNotice,
   PHASE_LABELS,
   RESOURCE_LABELS,
   RISK_LABELS,
   STAGE_LABELS,
   STATUS_LABELS,
+  computeBundleSignature,
+  isPreExecutionStatus,
+  recomputeRollbackReadiness,
   validateChange,
 } from '../../models/change-request.model';
 import { ChangeRequestService } from '../../services/change-request.service';
@@ -57,6 +62,10 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <h1>{{ item.title }}</h1>
             </div>
             <span class="status" [class]="item.status">{{ statusLabel(item.status) }}</span>
+            <span class="version-badge">方案 v{{ item.schemeVersion }}</span>
+            @if (item.executionSnapshot; as snapshot) {
+              <span class="snapshot-badge">执行快照 v{{ snapshot.schemeVersion }}</span>
+            }
           </div>
           <p>{{ item.summary || '尚未填写变更摘要。' }}</p>
         </div>
@@ -76,12 +85,61 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         </div>
       </section>
 
+      @if (staleView()) {
+        <div class="stale-banner">
+          <div>
+            <strong>页面基于过期方案版本</strong>
+            <p>
+              本页打开时记住的是 v{{ pageBaseVersion() }}，另一标签页已保存为 v{{
+                item.schemeVersion
+              }}。为避免覆盖新关系，直接提交只会留下待复核草稿。
+            </p>
+          </div>
+          <button class="btn btn-primary btn-sm" type="button" (click)="refreshToLatest()">
+            刷新并对齐 v{{ item.schemeVersion }}
+          </button>
+        </div>
+      }
+
+      @if (signatureMismatch() && isPre(item.status)) {
+        <div class="invalidate-banner">
+          <strong>会签已与当前方案解绑</strong>
+          <p>
+            会签后资源依赖、执行窗口或回滚步骤发生变化，v{{ item.schemeVersion }}
+            之前的四级会签已失效，需按新版本重新会签。
+          </p>
+        </div>
+      }
+
+      @if (item.reviewDraft; as review) {
+        <div class="review-draft-banner">
+          <div>
+            <strong>存在待复核草稿（来自 v{{ review.baseVersion }}）</strong>
+            <p>{{ review.note }}</p>
+            @if (review.approvalIntent; as intent) {
+              <p>
+                会签意向：{{ stageLabel(intent.stage) }}
+                {{ intent.decision === 'approved' ? '批准' : '退回' }}，{{ intent.approver }}：{{
+                  intent.comment
+                }}
+              </p>
+            }
+          </div>
+          <div class="banner-actions">
+            <button class="btn btn-sm" type="button" (click)="discardReviewDraft()">丢弃</button>
+            <button class="btn btn-primary btn-sm" type="button" (click)="adoptReviewDraft()">
+              采纳并并入最新版本
+            </button>
+          </div>
+        </div>
+      }
+
       <nav class="tab-nav" aria-label="变更详情">
         @for (tab of tabs; track tab.id) {
           <button
             type="button"
             [class.active]="selectedTab() === tab.id"
-            (click)="selectedTab.set(tab.id)"
+            (click)="tab.id === 'approval' ? openApprovalTab() : selectedTab.set(tab.id)"
           >
             {{ tab.label }}
             @if (tab.id === 'approval' && pendingStage(); as stage) {
@@ -90,6 +148,39 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
           </button>
         }
       </nav>
+
+      @if (impactNotices(item).length; as noticeCount) {
+        <section class="notice-strip" [class.has-advisory]="advisoryNotices().length > 0">
+          <header>
+            <h2>前置资源变化影响提示（{{ noticeCount }}）</h2>
+            <span>未执行变化会令会签失效并重算回滚；执行中变化不改正在执行的步骤</span>
+          </header>
+          @for (notice of impactNotices(item); track notice.id) {
+            <article [class.invalidated]="notice.kind === 'upstream-invalidated'">
+              <div>
+                <strong>
+                  {{ notice.kind === 'upstream-invalidated' ? '会签失效' : '执行期提示' }}：{{
+                    notice.title
+                  }}
+                </strong>
+                <p>{{ notice.detail }}</p>
+                <small>
+                  {{ notice.recordedAt | date: 'MM-dd HH:mm' }} · 波及：{{
+                    notice.affectedResourceIds.join('、')
+                  }}
+                </small>
+              </div>
+              @if (notice.kind === 'upstream-invalidated' && !notice.acknowledged) {
+                <button class="btn btn-sm" type="button" (click)="acknowledgeImpact(notice.id)">
+                  已核对新关系
+                </button>
+              } @else if (notice.acknowledged) {
+                <span class="ack-tag">已核对</span>
+              }
+            </article>
+          }
+        </section>
+      }
 
       @switch (selectedTab()) {
         @case ('overview') {
@@ -159,7 +250,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     </clr-input-container>
                   </div>
                   <div class="edit-actions">
-                    <button class="btn btn-primary" type="button" (click)="saveEdit()">保存方案</button>
+                    <button class="btn btn-primary" type="button" (click)="saveEdit()">
+                      保存方案
+                    </button>
                   </div>
                 </div>
               } @else {
@@ -181,7 +274,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </div>
                   <div>
                     <dt>当前门禁</dt>
-                    <dd>{{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}</dd>
+                    <dd>
+                      {{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}
+                    </dd>
                   </div>
                 </dl>
               }
@@ -192,12 +287,56 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
             <section class="surface span-2">
               <div class="surface-heading">
                 <div>
-                  <h2>资源清单</h2>
-                  <span>{{ item.resources.length }} 个对象，明确关键资源依赖</span>
+                  <h2>回滚能力（按最新资源关系重算）</h2>
+                  <span>前置机柜或共享资源变化后自动重算，与四级会签绑定同一方案版本</span>
                 </div>
+                @if (item.executionSnapshot) {
+                  <span class="snapshot-tag">
+                    执行步骤以 v{{ item.executionSnapshot.schemeVersion }} 快照为准
+                  </span>
+                }
+              </div>
+              @if (rollbackReadiness(); as readiness) {
+                <div class="readiness-grid">
+                  <div [class.ok]="readiness.executable" [class.bad]="!readiness.executable">
+                    <span>判定</span>
+                    <strong>{{ readiness.executable ? '可按新关系回滚' : '回滚能力不足' }}</strong>
+                  </div>
+                  <div>
+                    <span>关系闭包内关键资源</span>
+                    <strong>{{ readiness.criticalCount }} 个</strong>
+                  </div>
+                  <div>
+                    <span>可执行回滚步骤</span>
+                    <strong>{{ readiness.executableRollbackCount }} 项</strong>
+                  </div>
+                  <div class="readiness-footprint">
+                    <span>闭包资源</span>
+                    <strong>{{ readiness.footprint.join('、') || '无' }}</strong>
+                  </div>
+                </div>
+                @if (readiness.reasons.length) {
+                  <ul class="readiness-reasons">
+                    @for (reason of readiness.reasons; track reason) {
+                      <li>{{ reason }}</li>
+                    }
+                  </ul>
+                }
+              }
+            </section>
+
+            <section class="surface span-2">
+              <div class="surface-heading">
+                <div>
+                  <h2>资源清单</h2>
+                  <span>{{ effectiveResources().length }} 个对象，明确关键资源依赖</span>
+                </div>
+                @if (item.executionSnapshot) {
+                  <span class="snapshot-tag">批准快照 · 不可编辑</span>
+                }
               </div>
               <div class="resource-table">
-                @for (resource of item.resources; track resource.id) {
+                @for (resource of effectiveResources(); track resource.id) {
                   <article>
                     <span class="type">{{ resourceLabel(resource.type) }}</span>
                     <div>
@@ -222,8 +361,13 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 <h2>依赖关系图</h2>
                 <span>虚线表示依赖资源未纳入本次影响范围</span>
               </div>
+              @if (item.executionSnapshot) {
+                <span class="snapshot-tag"
+                  >展示批准快照 v{{ item.executionSnapshot.schemeVersion }}</span
+                >
+              }
             </div>
-            <app-dependency-graph [change]="item" />
+            <app-dependency-graph [change]="effectiveChange() ?? item" />
           </section>
         }
 
@@ -265,9 +409,17 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     开始执行
                   </button>
                 }
+                @if (item.executionSnapshot; as snapshot) {
+                  <span class="snapshot-tag">步骤锁定自批准快照 v{{ snapshot.schemeVersion }}</span>
+                }
               </div>
+              @if (item.status === 'executing' && signatureChangedAfterApproval(item)) {
+                <p class="snapshot-note">
+                  执行期间外部资源关系已有变化，但正在执行的步骤不会被修改，仅在上方记录影响提示。
+                </p>
+              }
               <div class="step-list">
-                @for (step of stepsBy(item); track step.id) {
+                @for (step of visibleSteps(); track step.id) {
                   <label class="step-row" [class.completed]="step.completed">
                     <input
                       type="checkbox"
@@ -294,7 +446,12 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <h2>实时执行记录</h2>
                   <span>记录偏离并明确继续、暂停或回滚</span>
                 </div>
-                <a class="btn btn-sm" href="https://logs.example.internal/change/{{ item.id }}" target="_blank" rel="noopener">
+                <a
+                  class="btn btn-sm"
+                  href="https://logs.example.internal/change/{{ item.id }}"
+                  target="_blank"
+                  rel="noopener"
+                >
                   打开实时日志
                 </a>
               </div>
@@ -327,7 +484,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </div>
                 </div>
                 <div class="completion-actions">
-                  <button class="btn" type="button" (click)="complete('rolled_back')">判定回滚</button>
+                  <button class="btn" type="button" (click)="complete('rolled_back')">
+                    判定回滚
+                  </button>
                   <button class="btn btn-primary" type="button" (click)="complete('completed')">
                     执行完成
                   </button>
@@ -370,6 +529,17 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </button>
                 }
               </div>
+              <div class="binding-line">
+                本页会签基线：<strong>v{{ approvalBaseVersion() }}</strong> · 当前方案：<strong
+                  >v{{ item.schemeVersion }}</strong
+                >
+                @if (item.boundSignature) {
+                  · 会签包：<code>{{ item.boundSignature }}</code>
+                }
+                @if (approvalBaseVersion() !== item.schemeVersion) {
+                  <span class="stale-tag">基线过期，签署将留存为待复核草稿</span>
+                }
+              </div>
               <ol class="approval-flow">
                 @for (approval of item.approvals; track approval.stage) {
                   <li [ngClass]="approval.state">
@@ -382,6 +552,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                       @if (approval.approver) {
                         <small>
                           {{ approval.approver }} · {{ approval.decidedAt | date: 'MM-dd HH:mm' }}
+                          @if (approval.boundVersion) {
+                            · v{{ approval.boundVersion }}
+                          }
                         </small>
                       }
                     </div>
@@ -397,7 +570,11 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <span>只有当前顺位负责人可以签署</span>
                 </div>
               </div>
-              @if (pendingStage(); as stage) {
+              @if (signatureMismatch()) {
+                <p class="approved-message warning">
+                  资源依赖、执行窗口或回滚步骤已与会签时不同，四级会签失效，请修改方案后重新提交。
+                </p>
+              } @else if (pendingStage(); as stage) {
                 @if (item.status === 'submitted' || item.status === 'rejected') {
                   <div class="approval-form">
                     <clr-input-container>
@@ -428,9 +605,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <p class="empty">当前状态不允许审批操作。</p>
                 }
               } @else {
-                <p class="approved-message">
-                  会签已完成。开始执行后审批记录自动冻结，不允许修改。
-                </p>
+                <p class="approved-message">会签已完成。开始执行后审批记录自动冻结，不允许修改。</p>
               }
             </section>
 
@@ -446,6 +621,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <div>
                     <span>{{ stageLabel(approval.stage) }}</span>
                     <strong>{{ approvalStateText(approval.state) }}</strong>
+                    @if (approval.boundVersion) {
+                      <small>v{{ approval.boundVersion }}</small>
+                    }
                   </div>
                 }
               </div>
@@ -610,6 +788,209 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         border-color: #d58d7e;
         background: #fbece8;
         color: #8e260f;
+      }
+
+      .version-badge,
+      .snapshot-badge {
+        padding: 3px 9px;
+        border: 1px solid #b7a56d;
+        background: #fbf5e3;
+        color: #7c5d00;
+        font-size: 11px;
+        font-weight: 600;
+      }
+
+      .snapshot-badge {
+        border-color: #4b8d65;
+        background: #e8f5ed;
+        color: #245f3d;
+      }
+
+      .stale-banner,
+      .review-draft-banner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        margin: 16px 0;
+        padding: 14px 18px;
+        border: 1px solid #d0a251;
+        border-left-width: 4px;
+        background: #fff7e6;
+      }
+
+      .stale-banner p,
+      .review-draft-banner p,
+      .invalidate-banner p {
+        margin: 4px 0 0;
+        color: #6b5518;
+        font-size: 13px;
+      }
+
+      .banner-actions {
+        display: flex;
+        gap: 8px;
+        white-space: nowrap;
+      }
+
+      .invalidate-banner {
+        margin: 16px 0;
+        padding: 14px 18px;
+        border-left: 4px solid #c21d00;
+        background: #fbece8;
+      }
+
+      .invalidate-banner p {
+        color: #8e260f;
+      }
+
+      .notice-strip {
+        margin: 16px 0;
+        border: 1px solid #d7d7d7;
+        background: #fff;
+      }
+
+      .notice-strip header {
+        padding: 12px 18px;
+        border-bottom: 1px solid #e3e3e3;
+        background: #fafafa;
+      }
+
+      .notice-strip h2 {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .notice-strip header span {
+        color: #777;
+        font-size: 12px;
+      }
+
+      .notice-strip article {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 12px 18px;
+        border-bottom: 1px solid #eee;
+      }
+
+      .notice-strip article:last-child {
+        border-bottom: 0;
+      }
+
+      .notice-strip article.invalidated {
+        background: #fdf4f2;
+      }
+
+      .notice-strip p {
+        margin: 4px 0;
+        font-size: 13px;
+        color: #4c4c4c;
+      }
+
+      .notice-strip small {
+        color: #888;
+      }
+
+      .ack-tag {
+        color: #245f3d;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .readiness-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 1px;
+        margin-top: 16px;
+        background: #e1e1e1;
+      }
+
+      .readiness-grid div {
+        padding: 14px;
+        background: #fafafa;
+      }
+
+      .readiness-grid span {
+        display: block;
+        color: #666;
+        font-size: 12px;
+      }
+
+      .readiness-grid strong {
+        display: block;
+        margin-top: 4px;
+        font-size: 14px;
+      }
+
+      .readiness-grid div.ok strong {
+        color: #245f3d;
+      }
+
+      .readiness-grid div.bad strong {
+        color: #8e260f;
+      }
+
+      .readiness-footprint strong {
+        font-size: 11px !important;
+        font-weight: 500 !important;
+        word-break: break-all;
+      }
+
+      .readiness-reasons {
+        margin: 12px 0 0;
+        padding-left: 20px;
+        color: #8e260f;
+        font-size: 13px;
+      }
+
+      .snapshot-tag {
+        padding: 3px 8px;
+        border: 1px solid #4b8d65;
+        background: #e8f5ed;
+        color: #245f3d;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .snapshot-note {
+        margin: 12px 0 0;
+        padding: 10px 12px;
+        border-left: 3px solid #d0a251;
+        background: #fff7e6;
+        color: #6b5518;
+        font-size: 12px;
+      }
+
+      .binding-line {
+        margin-top: 14px;
+        padding: 10px 12px;
+        background: #f4f6f7;
+        font-size: 12px;
+        color: #555;
+      }
+
+      .binding-line code {
+        font-size: 11px;
+      }
+
+      .stale-tag {
+        margin-left: 8px;
+        padding: 2px 6px;
+        background: #c21d00;
+        color: #fff;
+      }
+
+      .approved-message.warning {
+        border-left-color: #d0a251;
+        background: #fff7e6;
+        color: #7c5d00;
+      }
+
+      .freeze-strip small {
+        color: #888;
+        font-size: 10px;
       }
 
       .tab-nav {
@@ -988,6 +1369,14 @@ export class ChangeDetailComponent {
   readonly deviationText = signal('');
   readonly deviationDecision = signal<DeviationRecord['decision']>('continue');
 
+  /**
+   * 审批页打开时记住的方案版本。编辑保存、提交会签、各阶段签署均以此做乐观并发校验；
+   * 另一标签页先保存后，旧页面提交只能留下待复核草稿。
+   */
+  readonly pageBaseVersion = signal(1);
+  /** 进入审批标签页时锁定的版本，仅用于会签动作 */
+  readonly approvalBaseVersion = signal(1);
+
   readonly tabs: Array<{ id: DetailTab; label: string }> = [
     { id: 'overview', label: '方案概览' },
     { id: 'dependency', label: '依赖关系' },
@@ -1006,9 +1395,68 @@ export class ChangeDetailComponent {
     this.issues().some((issue) => issue.severity === 'blocker'),
   );
 
+  /** 当前方案包签名与会签绑定签名不一致（会签后又动了资源关系/窗口/回滚） */
+  readonly signatureMismatch = computed(() => {
+    const item = this.change();
+    return !!item && !!item.boundSignature && item.boundSignature !== computeBundleSignature(item);
+  });
+
+  /** 旧页面提示：另一标签页已保存更新版本 */
+  readonly staleView = computed(() => {
+    const item = this.change();
+    return !!item && this.pageBaseVersion() < item.schemeVersion;
+  });
+
+  /** 执行中方案展示批准时快照；其他状态展示当前方案 */
+  readonly effectiveChange = computed(() => {
+    const item = this.change();
+    if (!item || item.status !== 'executing' || !item.executionSnapshot) {
+      return item;
+    }
+    const snapshot = item.executionSnapshot;
+    return {
+      ...item,
+      resources: snapshot.resources,
+      steps: snapshot.steps,
+      window: snapshot.window,
+    };
+  });
+
+  readonly rollbackReadiness = computed(() => {
+    const item = this.change();
+    return item ? recomputeRollbackReadiness(item, this.changes()) : null;
+  });
+
+  readonly pendingUpstreamNotices = computed(() =>
+    (this.change()?.impactNotices ?? []).filter(
+      (notice) => notice.kind === 'upstream-invalidated' && !notice.acknowledged,
+    ),
+  );
+
+  readonly advisoryNotices = computed(() =>
+    (this.change()?.impactNotices ?? []).filter((notice) => notice.kind === 'execution-advisory'),
+  );
+
+  private versionLocked = false;
+
+  constructor() {
+    // 审批页打开时记住版本：仅在首次拿到方案时锁定一次，后续本页操作不刷新基线
+    effect(() => {
+      const item = this.change();
+      if (item && !this.versionLocked) {
+        this.versionLocked = true;
+        this.pageBaseVersion.set(item.schemeVersion);
+        this.approvalBaseVersion.set(item.schemeVersion);
+      }
+    });
+  }
+
   readonly pendingStage = computed<ApprovalStage | null>(() => {
     const item = this.change();
     if (!item || !['submitted', 'rejected'].includes(item.status)) {
+      return null;
+    }
+    if (this.signatureMismatch()) {
       return null;
     }
     const rejected = item.approvals.find((approval) => approval.state === 'rejected');
@@ -1017,6 +1465,26 @@ export class ChangeDetailComponent {
     }
     return item.approvals.find((approval) => approval.state === 'pending')?.stage ?? null;
   });
+
+  /** 进入审批标签页时把会签基线对齐到当时版本 */
+  openApprovalTab(): void {
+    const item = this.change();
+    this.selectedTab.set('approval');
+    if (item) {
+      this.approvalBaseVersion.set(item.schemeVersion);
+    }
+  }
+
+  /** 刷新到最新版本并重新记住基线 */
+  refreshToLatest(): void {
+    const item = this.change();
+    if (item) {
+      this.pageBaseVersion.set(item.schemeVersion);
+      this.approvalBaseVersion.set(item.schemeVersion);
+    }
+    this.editing.set(false);
+    this.draft.set(null);
+  }
 
   beginEdit(): void {
     const item = this.change();
@@ -1058,14 +1526,32 @@ export class ChangeDetailComponent {
     if (!draft) {
       return;
     }
-    this.store.dispatch(ChangeRequestActions.updateChange({ change: draft }));
+    const baseVersion = this.pageBaseVersion();
+    // 携带审批页打开时记住的版本：过期则由 reducer 留存待复核草稿
+    this.store.dispatch(
+      ChangeRequestActions.updateChange({
+        change: draft,
+        baseVersion,
+      }),
+    );
+    // 保存成功后本页基线前进一个版本（过期提交落草稿时不变）
+    const latest = this.change();
+    if (latest && latest.schemeVersion === baseVersion + 1) {
+      this.pageBaseVersion.set(latest.schemeVersion);
+      this.approvalBaseVersion.set(latest.schemeVersion);
+    }
     this.editing.set(false);
     this.draft.set(null);
   }
 
   submitForReview(): void {
     if (!this.hasBlockers()) {
-      this.store.dispatch(ChangeRequestActions.submitForReview({ id: this.changeId }));
+      this.store.dispatch(
+        ChangeRequestActions.submitForReview({
+          id: this.changeId,
+          baseVersion: this.approvalBaseVersion(),
+        }),
+      );
     }
   }
 
@@ -1078,6 +1564,7 @@ export class ChangeDetailComponent {
         stage,
         approver,
         comment,
+        baseVersion: this.approvalBaseVersion(),
       }),
     );
     this.clearApprovalForm();
@@ -1095,9 +1582,28 @@ export class ChangeDetailComponent {
         stage,
         approver,
         comment,
+        baseVersion: this.approvalBaseVersion(),
       }),
     );
     this.clearApprovalForm();
+  }
+
+  adoptReviewDraft(): void {
+    this.store.dispatch(ChangeRequestActions.adoptReviewDraft({ id: this.changeId }));
+    // 采纳是显式复核动作，基线对齐到复核后的最新版本
+    const latest = this.change();
+    if (latest) {
+      this.pageBaseVersion.set(latest.schemeVersion);
+      this.approvalBaseVersion.set(latest.schemeVersion);
+    }
+  }
+
+  discardReviewDraft(): void {
+    this.store.dispatch(ChangeRequestActions.discardReviewDraft({ id: this.changeId }));
+  }
+
+  acknowledgeImpact(noticeId: string): void {
+    this.store.dispatch(ChangeRequestActions.acknowledgeImpact({ id: this.changeId, noticeId }));
   }
 
   startExecution(): void {
@@ -1129,7 +1635,9 @@ export class ChangeDetailComponent {
       result === 'completed'
         ? '观察窗口内指标稳定，变更完成。'
         : '发现不可接受影响，按方案完成回滚。';
-    this.store.dispatch(ChangeRequestActions.completeExecution({ id: this.changeId, result, note }));
+    this.store.dispatch(
+      ChangeRequestActions.completeExecution({ id: this.changeId, result, note }),
+    );
   }
 
   exportRetrospective(): void {
@@ -1154,6 +1662,27 @@ export class ChangeDetailComponent {
       const phase = order.indexOf(left.phase) - order.indexOf(right.phase);
       return phase || left.id.localeCompare(right.id);
     });
+  }
+
+  /** 执行中页面只呈现批准时快照里的步骤 */
+  readonly visibleSteps = computed(() => {
+    const effective = this.effectiveChange();
+    return effective ? this.stepsBy(effective) : [];
+  });
+
+  /** 执行中页面只呈现批准时快照里的资源 */
+  readonly effectiveResources = computed(() => this.effectiveChange()?.resources ?? []);
+
+  impactNotices(item: ChangeRequest): ImpactNotice[] {
+    return item.impactNotices ?? [];
+  }
+
+  isPre(status: ChangeRequest['status']): boolean {
+    return isPreExecutionStatus(status);
+  }
+
+  signatureChangedAfterApproval(item: ChangeRequest): boolean {
+    return !!item.executionSnapshot && item.executionSnapshot.schemeVersion !== item.schemeVersion;
   }
 
   completedSteps(change: ChangeRequest): number {

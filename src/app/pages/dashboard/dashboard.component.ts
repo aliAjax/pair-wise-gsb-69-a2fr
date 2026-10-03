@@ -101,11 +101,7 @@ import {
         </clr-select-container>
         <clr-select-container>
           <label>资源类型</label>
-          <select
-            clrSelect
-            [ngModel]="resourceType()"
-            (ngModelChange)="resourceType.set($event)"
-          >
+          <select clrSelect [ngModel]="resourceType()" (ngModelChange)="resourceType.set($event)">
             <option value="all">全部资源</option>
             @for (item of resourceTypes; track item.value) {
               <option [value]="item.value">{{ item.label }}</option>
@@ -146,7 +142,13 @@ import {
                   </a>
                 </td>
                 <td>
-                  <span class="status" [class]="change.status">{{ statusLabel(change.status) }}</span>
+                  <span class="status" [class]="change.status">{{
+                    statusLabel(change.status)
+                  }}</span>
+                  <span class="version-mini">v{{ change.schemeVersion ?? 1 }}</span>
+                  @if (change.reviewDraft) {
+                    <span class="review-mini">待复核草稿</span>
+                  }
                 </td>
                 <td>
                   <span class="risk" [class]="change.risk">{{ riskLabel(change.risk) }}</span>
@@ -391,6 +393,23 @@ import {
         color: #737373;
       }
 
+      .version-mini,
+      .review-mini {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 1px 6px;
+        border: 1px solid #b7a56d;
+        background: #fbf5e3;
+        color: #7c5d00;
+        font-size: 10px;
+      }
+
+      .review-mini {
+        border-color: #d0a251;
+        background: #fff2d6;
+        font-weight: 600;
+      }
+
       @media (max-width: 980px) {
         .stats {
           grid-template-columns: repeat(2, 1fr);
@@ -461,8 +480,10 @@ export class DashboardComponent {
       ).length,
   );
 
-  readonly todayWindowCount = computed(() =>
-    this.filteredChanges().filter((change) => change.window.start.startsWith('2026-09-29')).length,
+  readonly todayWindowCount = computed(
+    () =>
+      this.filteredChanges().filter((change) => change.window.start.startsWith('2026-09-29'))
+        .length,
   );
 
   reload(): void {

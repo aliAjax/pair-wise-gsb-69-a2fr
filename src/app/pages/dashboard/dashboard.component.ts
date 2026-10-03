@@ -46,17 +46,17 @@ import {
       <article>
         <span>执行中</span>
         <strong>{{ countByStatus('executing') }}</strong>
-        <small>需持续记录偏离</small>
+        <small>按批准快照执行</small>
+      </article>
+      <article class="danger">
+        <span>待复核草稿</span>
+        <strong>{{ countByStatus('pending_review') }}</strong>
+        <small>会签失效，需重走会签</small>
       </article>
       <article class="danger">
         <span>有阻断项</span>
         <strong>{{ blockedCount() }}</strong>
         <small>依赖、冲突或回滚风险</small>
-      </article>
-      <article>
-        <span>今日窗口</span>
-        <strong>{{ todayWindowCount() }}</strong>
-        <small>基于当前筛选数据</small>
       </article>
     </section>
 
@@ -141,7 +141,7 @@ import {
               <tr>
                 <td>
                   <a [routerLink]="['/changes', change.id]" class="change-link">
-                    <span>{{ change.id }}</span>
+                    <span>{{ change.id }} · v{{ change.version }}</span>
                     <strong>{{ change.title }}</strong>
                   </a>
                 </td>
@@ -357,6 +357,12 @@ import {
         border-color: #5688a5;
         color: #215a78;
         background: #eaf4f9;
+      }
+
+      .status.pending_review {
+        border-color: #d0a251;
+        color: #7c5000;
+        background: #fff7e6;
       }
 
       .status.rejected,

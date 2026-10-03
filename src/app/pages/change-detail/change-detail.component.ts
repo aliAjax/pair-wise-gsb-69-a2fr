@@ -3,6 +3,7 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  effect,
   inject,
   signal,
 } from '@angular/core';
@@ -19,11 +20,15 @@ import {
   ChangeRequest,
   ChangeStep,
   DeviationRecord,
+  ExecutionSnapshot,
+  ImpactNotice,
   PHASE_LABELS,
   RESOURCE_LABELS,
   RISK_LABELS,
+  RollbackAssessment,
   STAGE_LABELS,
   STATUS_LABELS,
+  boundContentEquals,
   validateChange,
 } from '../../models/change-request.model';
 import { ChangeRequestService } from '../../services/change-request.service';
@@ -48,6 +53,49 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
   ],
   template: `
     @if (change(); as item) {
+      @if (stale()) {
+        <clr-alert clrAlertType="warning" [clrAlertClosable]="false">
+          <clr-alert-item>
+            <span class="alert-text">
+              本页基于方案 v{{ pageVersion() }}，最新版本已是 v{{ item.version }}（可能由另一标签页先保存）。
+              当前页面提交不会覆盖新版本，只会把方案留为待复核草稿并使会签失效。
+            </span>
+            <div class="alert-actions">
+              <button class="btn btn-sm btn-warning" type="button" (click)="rebaseToLatest()">
+                刷新到最新版本
+              </button>
+            </div>
+          </clr-alert-item>
+        </clr-alert>
+      }
+      @if (item.status === 'pending_review') {
+        <clr-alert clrAlertType="alert" [clrAlertClosable]="false">
+          <clr-alert-item>
+            <span class="alert-text">
+              方案处于待复核草稿：会签已在会签后因版本变化失效，资源关系与回滚步骤核对无误后请重新提交四级会签。
+            </span>
+          </clr-alert-item>
+        </clr-alert>
+      }
+      @if (unacknowledgedNotices().length) {
+        @for (notice of unacknowledgedNotices(); track notice.id) {
+          <clr-alert clrAlertType="danger" [clrAlertClosable]="false">
+            <clr-alert-item>
+              <span class="alert-text">
+                上游资源关系在执行期间发生变化（{{ notice.observedAt | date: 'MM-dd HH:mm' }}）：
+                {{ notice.detail }}
+                正在执行的步骤维持批准时快照，不做改动。
+              </span>
+              <div class="alert-actions">
+                <button class="btn btn-sm" type="button" (click)="acknowledgeNotice(notice.id)">
+                  已知悉，挂为影响提示
+                </button>
+              </div>
+            </clr-alert-item>
+          </clr-alert>
+        }
+      }
+
       <section class="detail-heading">
         <div class="heading-main">
           <a routerLink="/" class="back-link">返回变更队列</a>
@@ -66,8 +114,13 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
             <strong>{{ item.owner }}</strong>
           </div>
           <div>
-            <span>风险</span>
-            <strong>{{ riskLabel(item.risk) }}</strong>
+            <span>方案版本</span>
+            <strong>
+              v{{ item.version }}
+              @if (snapshot(); as snap) {
+                                · 执行依据 v{{ snap.version }}
+              }
+            </strong>
           </div>
           <div>
             <span>更新</span>
@@ -98,19 +151,29 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>方案概览</h2>
-                  <span>影响范围、值班和执行边界</span>
+                  <span>影响范围、值班和执行边界 · 资源依赖/窗口/回滚步骤与版本绑定</span>
                 </div>
                 <button
                   class="btn btn-sm"
                   type="button"
                   (click)="editing() ? cancelEdit() : beginEdit()"
-                  [disabled]="item.status === 'executing' || item.status === 'completed'"
+                  [disabled]="item.status === 'executing' || item.status === 'completed' || item.status === 'rolled_back'"
                 >
                   {{ editing() ? '取消编辑' : '编辑方案' }}
                 </button>
               </div>
 
               @if (editing()) {
+                @if (['submitted', 'approved', 'rejected', 'pending_review'].includes(item.status)) {
+                  <div class="inline-warning">
+                    会签后修改资源依赖、执行窗口或回滚步骤会生成新版本并使原会签失效，方案回到待复核草稿。
+                  </div>
+                }
+                @if (stale()) {
+                  <div class="inline-warning danger">
+                    本页记住的是 v{{ pageVersion() }}，最新为 v{{ item.version }}，保存不会覆盖新版本内容。
+                  </div>
+                }
                 <div class="edit-form">
                   <clr-input-container>
                     <label>标题</label>
@@ -159,6 +222,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     </clr-input-container>
                   </div>
                   <div class="edit-actions">
+                    @if (editingBoundContent()) {
+                      <span class="version-hint">将保存为新版本，绑定内容已变更</span>
+                    }
                     <button class="btn btn-primary" type="button" (click)="saveEdit()">保存方案</button>
                   </div>
                 </div>
@@ -180,6 +246,10 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     <dd>{{ item.onCall.join('、') }}</dd>
                   </div>
                   <div>
+                    <dt>风险等级</dt>
+                    <dd>{{ riskLabel(item.risk) }}</dd>
+                  </div>
+                  <div class="span-2">
                     <dt>当前门禁</dt>
                     <dd>{{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}</dd>
                   </div>
@@ -188,6 +258,55 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
             </section>
 
             <app-validation-panel [change]="item" [allChanges]="changes()" />
+
+            @if (rollbackAssessment(); as assessment) {
+              <section class="surface assessment">
+                <div class="surface-heading">
+                  <div>
+                    <h2>回滚能力（按资源关系重算）</h2>
+                    <span>
+                      评估基于 v{{ assessment.basedOnVersion }}
+                      @if (assessment.basedOnVersion !== item.version) {
+                        · 已落后当前 v{{ item.version }}，需重新评估
+                      }
+                    </span>
+                  </div>
+                  <span
+                    class="assessment-badge"
+                    [class.bad]="!assessment.executable || assessment.basedOnVersion !== item.version"
+                  >
+                    {{ assessment.executable ? '可执行' : '不可执行' }}
+                  </span>
+                </div>
+                <dl class="facts compact">
+                  <div>
+                    <dt>覆盖资源</dt>
+                    <dd>{{ assessment.coveredResourceIds.length }} 个</dd>
+                  </div>
+                  <div>
+                    <dt>未覆盖资源</dt>
+                    <dd>
+                      {{
+                        assessment.uncoveredResourceIds.length
+                          ? assessment.uncoveredResourceIds.map((id) => resourceName(id)).join('、')
+                          : '无'
+                      }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>缺责任人回滚步骤</dt>
+                    <dd>{{ assessment.stepsMissingOwner.length }}</dd>
+                  </div>
+                  <div>
+                    <dt>缺命令回滚步骤</dt>
+                    <dd>{{ assessment.stepsMissingCommand.length }}</dd>
+                  </div>
+                </dl>
+                <p class="assessment-foot">
+                  前置机柜或共享资源关系一变，未执行方案的回滚能力会按新关系自动重算并阻断重新会签。
+                </p>
+              </section>
+            }
 
             <section class="surface span-2">
               <div class="surface-heading">
@@ -258,7 +377,12 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>执行步骤</h2>
-                  <span>执行中可逐项勾选，所有操作保留时间戳</span>
+                  <span>
+                    执行中可逐项勾选，所有操作保留时间戳
+                    @if (snapshot(); as snap) {
+                      · 步骤以批准快照 v{{ snap.version }} 为准，后续资源变化不改执行步骤
+                    }
+                  </span>
                 </div>
                 @if (item.status === 'approved') {
                   <button class="btn btn-primary" type="button" (click)="startExecution()">
@@ -267,7 +391,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 }
               </div>
               <div class="step-list">
-                @for (step of stepsBy(item); track step.id) {
+                @for (step of displaySteps(); track step.id) {
                   <label class="step-row" [class.completed]="step.completed">
                     <input
                       type="checkbox"
@@ -349,6 +473,39 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               </div>
             </section>
           </div>
+
+          @if (item.impactNotices.length) {
+            <section class="surface span-2">
+              <div class="surface-heading">
+                <div>
+                  <h2>上游关系变化影响提示</h2>
+                  <span>
+                    执行中方案保留批准快照，前置机柜/共享资源的后续变化只挂提示，不改正执行中的步骤
+                  </span>
+                </div>
+              </div>
+              <div class="notice-list">
+                @for (notice of item.impactNotices; track notice.id) {
+                  <article [class.acknowledged]="notice.acknowledged">
+                    <div>
+                      <strong>{{ notice.sourceChangeId }}</strong>
+                      <time>{{ notice.observedAt | date: 'MM-dd HH:mm' }}</time>
+                    </div>
+                    <p>{{ notice.detail }}</p>
+                    <span>
+                      影响资源：{{ notice.changedResourceIds.map((id) => resourceName(id)).join('、') }}
+                      · {{ notice.acknowledged ? '已确认' : '待确认' }}
+                    </span>
+                    @if (!notice.acknowledged) {
+                      <button class="btn btn-sm" type="button" (click)="acknowledgeNotice(notice.id)">
+                        已知悉
+                      </button>
+                    }
+                  </article>
+                }
+              </div>
+            </section>
+          }
         }
 
         @case ('approval') {
@@ -357,16 +514,19 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>顺序会签</h2>
-                  <span>必须按网络、系统、安全、业务顺序完成</span>
+                  <span>
+                    必须按网络、系统、安全、业务顺序完成 · 签署基于方案
+                    v{{ pageVersion() ?? item.version }}
+                  </span>
                 </div>
-                @if (item.status === 'draft' || item.status === 'rejected') {
+                @if (['draft', 'rejected', 'pending_review'].includes(item.status)) {
                   <button
                     class="btn btn-primary"
                     type="button"
                     (click)="submitForReview()"
                     [disabled]="hasBlockers()"
                   >
-                    提交审批
+                    {{ item.status === 'pending_review' ? '重新提交审批' : '提交审批' }}
                   </button>
                 }
               </div>
@@ -381,7 +541,11 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                       </p>
                       @if (approval.approver) {
                         <small>
-                          {{ approval.approver }} · {{ approval.decidedAt | date: 'MM-dd HH:mm' }}
+                          {{ approval.approver }}
+                          @if (approval.signedVersion) {
+                            · v{{ approval.signedVersion }}
+                          }
+                          · {{ approval.decidedAt | date: 'MM-dd HH:mm' }}
                         </small>
                       }
                     </div>
@@ -398,8 +562,14 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 </div>
               </div>
               @if (pendingStage(); as stage) {
-                @if (item.status === 'submitted' || item.status === 'rejected') {
+                @if (item.status === 'submitted') {
                   <div class="approval-form">
+                    @if (stale()) {
+                      <div class="inline-warning danger">
+                        本页打开后方案已被更新到 v{{ item.version }}，此刻批准/退回不会生效，
+                        仅会把方案留为待复核草稿。请先刷新到最新版本再签署。
+                      </div>
+                    }
                     <clr-input-container>
                       <label>审批人</label>
                       <input
@@ -438,7 +608,14 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>审批冻结快照</h2>
-                  <span>执行与复盘以冻结版本为准</span>
+                  <span>
+                    @if (snapshot(); as snap) {
+                      四级会签于 {{ snap.createdAt | date: 'MM-dd HH:mm' }} 完成，执行与复盘以
+                      v{{ snap.version }} 冻结版本为准
+                    } @else {
+                      批准时生成快照；会签失效或尚未批准时暂无冻结版本
+                    }
+                  </span>
                 </div>
               </div>
               <div class="freeze-strip">
@@ -446,6 +623,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <div>
                     <span>{{ stageLabel(approval.stage) }}</span>
                     <strong>{{ approvalStateText(approval.state) }}</strong>
+                    @if (approval.signedVersion) {
+                      <small>签署于 v{{ approval.signedVersion }}</small>
+                    }
                   </div>
                 }
               </div>
@@ -598,6 +778,93 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         color: #1d5877;
       }
 
+      .status.pending_review {
+        border-color: #d0a251;
+        background: #fff7e6;
+        color: #7c5000;
+      }
+
+      .alert-actions {
+        margin-top: 8px;
+      }
+
+      .inline-warning {
+        margin-bottom: 12px;
+        padding: 10px 12px;
+        border-left: 3px solid #d99000;
+        background: #fff7e6;
+        color: #7c5000;
+        font-size: 12px;
+      }
+
+      .inline-warning.danger {
+        border-left-color: #c21d00;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .version-hint {
+        align-self: center;
+        margin-right: auto;
+        color: #7c5000;
+        font-size: 12px;
+      }
+
+      .assessment-badge {
+        padding: 3px 10px;
+        border: 1px solid #8fb99f;
+        background: #edf7f0;
+        color: #286140;
+        font-size: 12px;
+      }
+
+      .assessment-badge.bad {
+        border-color: #d58d7e;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .assessment-foot {
+        margin: 12px 0 0;
+        color: #6b6b6b;
+        font-size: 12px;
+      }
+
+      .notice-list article {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 6px 14px;
+        padding: 14px 4px;
+        border-bottom: 1px solid #e6e6e6;
+        border-left: 3px solid #c21d00;
+        padding-left: 12px;
+      }
+
+      .notice-list article.acknowledged {
+        border-left-color: #8fb99f;
+        opacity: 0.75;
+      }
+
+      .notice-list article > div {
+        display: flex;
+        justify-content: space-between;
+      }
+
+      .notice-list p {
+        grid-column: 1 / -1;
+        margin: 4px 0;
+      }
+
+      .notice-list span {
+        color: #8e260f;
+        font-size: 11px;
+      }
+
+      .notice-list .btn {
+        grid-row: 1;
+        grid-column: 2;
+      }
+
       .status.executing,
       .status.completed {
         border-color: #75a489;
@@ -705,6 +972,10 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
 
       .facts.compact {
         margin-top: 16px;
+      }
+
+      .facts .span-2 {
+        grid-column: 1 / -1;
       }
 
       .edit-form {
@@ -868,6 +1139,16 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         color: #8e260f;
       }
 
+      .approval-flow li.invalidated {
+        opacity: 0.8;
+      }
+
+      .approval-flow li.invalidated .flow-index {
+        border-color: #d0a251;
+        background: #fff7e6;
+        color: #7c5000;
+      }
+
       .approval-flow p {
         margin: 5px 0;
         color: #5f5f5f;
@@ -911,6 +1192,12 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
 
       .freeze-strip strong {
         margin-top: 4px;
+      }
+
+      .freeze-strip small {
+        margin-top: 3px;
+        color: #737373;
+        font-size: 11px;
       }
 
       .retrospective-note {
@@ -987,6 +1274,11 @@ export class ChangeDetailComponent {
   readonly approvalComment = signal('');
   readonly deviationText = signal('');
   readonly deviationDecision = signal<DeviationRecord['decision']>('continue');
+  /**
+   * 审批页打开时记住的方案版本。审批操作与保存都带上该值做乐观并发校验：
+   * 另一标签页先保存后，这里仍停留在旧版本，提交只会留下待复核草稿。
+   */
+  readonly pageVersion = signal<number | null>(null);
 
   readonly tabs: Array<{ id: DetailTab; label: string }> = [
     { id: 'overview', label: '方案概览' },
@@ -1006,9 +1298,23 @@ export class ChangeDetailComponent {
     this.issues().some((issue) => issue.severity === 'blocker'),
   );
 
+  /** 页面记住的版本与 store 中最新版本是否不一致（旧标签页场景）。 */
+  readonly stale = computed(() => {
+    const item = this.change();
+    const pageVersion = this.pageVersion();
+    return !!item && pageVersion !== null && item.version !== pageVersion;
+  });
+
+  /** 编辑中的草稿相对页面打开时是否改动了绑定内容（资源依赖/窗口/回滚步骤）。 */
+  readonly editingBoundContent = computed(() => {
+    const item = this.change();
+    const draft = this.draft();
+    return !!item && !!draft && !boundContentEquals(item, draft);
+  });
+
   readonly pendingStage = computed<ApprovalStage | null>(() => {
     const item = this.change();
-    if (!item || !['submitted', 'rejected'].includes(item.status)) {
+    if (!item || !['submitted'].includes(item.status)) {
       return null;
     }
     const rejected = item.approvals.find((approval) => approval.state === 'rejected');
@@ -1017,6 +1323,55 @@ export class ChangeDetailComponent {
     }
     return item.approvals.find((approval) => approval.state === 'pending')?.stage ?? null;
   });
+
+  /** 进入执行后以批准快照为准的步骤清单（实时勾选状态从当前步骤合并）。 */
+  readonly snapshotSteps = computed<ChangeStep[] | null>(() => {
+    const item = this.change();
+    if (!item || !item.executionSnapshot) {
+      return null;
+    }
+    if (item.status === 'approved') {
+      return item.executionSnapshot.steps;
+    }
+    const liveState = new Map(item.steps.map((step) => [step.id, step]));
+    return item.executionSnapshot.steps.map((step) => {
+      const live = liveState.get(step.id);
+      return live
+        ? { ...step, completed: live.completed, completedAt: live.completedAt }
+        : step;
+    });
+  });
+
+  readonly snapshot = computed<ExecutionSnapshot | null>(() => this.change()?.executionSnapshot ?? null);
+
+  readonly unacknowledgedNotices = computed<ImpactNotice[]>(() =>
+    (this.change()?.impactNotices ?? []).filter((notice) => !notice.acknowledged),
+  );
+
+  readonly rollbackAssessment = computed<RollbackAssessment | null>(
+    () => this.change()?.rollbackAssessment ?? null,
+  );
+
+  /**
+   * 审批页打开时记住版本：数据首次到达即锚定。
+   * 之后只有用户显式点击“刷新到最新版本”才更新锚点，模拟两个标签页各自持有版本。
+   */
+  private readonly anchorVersion = effect(() => {
+    const item = this.change();
+    if (item && this.pageVersion() === null) {
+      this.pageVersion.set(item.version);
+    }
+  });
+
+  rebaseToLatest(): void {
+    const item = this.change();
+    if (!item) {
+      return;
+    }
+    this.pageVersion.set(item.version);
+    this.editing.set(false);
+    this.draft.set(null);
+  }
 
   beginEdit(): void {
     const item = this.change();
@@ -1055,21 +1410,34 @@ export class ChangeDetailComponent {
 
   saveEdit(): void {
     const draft = this.draft();
-    if (!draft) {
+    const pageVersion = this.pageVersion();
+    if (!draft || pageVersion === null) {
       return;
     }
-    this.store.dispatch(ChangeRequestActions.updateChange({ change: draft }));
+    this.store.dispatch(
+      ChangeRequestActions.updateChange({ change: draft, expectedVersion: pageVersion }),
+    );
     this.editing.set(false);
     this.draft.set(null);
   }
 
   submitForReview(): void {
+    const pageVersion = this.pageVersion();
+    if (pageVersion === null) {
+      return;
+    }
     if (!this.hasBlockers()) {
-      this.store.dispatch(ChangeRequestActions.submitForReview({ id: this.changeId }));
+      this.store.dispatch(
+        ChangeRequestActions.submitForReview({ id: this.changeId, expectedVersion: pageVersion }),
+      );
     }
   }
 
   approve(stage: ApprovalStage): void {
+    const pageVersion = this.pageVersion();
+    if (pageVersion === null) {
+      return;
+    }
     const approver = this.approver().trim() || '当前用户';
     const comment = this.approvalComment().trim() || '同意按方案执行。';
     this.store.dispatch(
@@ -1078,12 +1446,17 @@ export class ChangeDetailComponent {
         stage,
         approver,
         comment,
+        expectedVersion: pageVersion,
       }),
     );
     this.clearApprovalForm();
   }
 
   reject(stage: ApprovalStage): void {
+    const pageVersion = this.pageVersion();
+    if (pageVersion === null) {
+      return;
+    }
     const approver = this.approver().trim() || '当前用户';
     const comment = this.approvalComment().trim();
     if (!comment) {
@@ -1095,17 +1468,36 @@ export class ChangeDetailComponent {
         stage,
         approver,
         comment,
+        expectedVersion: pageVersion,
       }),
     );
     this.clearApprovalForm();
   }
 
   startExecution(): void {
-    this.store.dispatch(ChangeRequestActions.startExecution({ id: this.changeId }));
+    const pageVersion = this.pageVersion();
+    if (pageVersion === null) {
+      return;
+    }
+    this.store.dispatch(
+      ChangeRequestActions.startExecution({ id: this.changeId, expectedVersion: pageVersion }),
+    );
   }
 
   toggleStep(stepId: string): void {
     this.store.dispatch(ChangeRequestActions.toggleStep({ id: this.changeId, stepId }));
+  }
+
+  acknowledgeNotice(noticeId: string): void {
+    this.store.dispatch(
+      ChangeRequestActions.acknowledgeImpactNotice({ id: this.changeId, noticeId }),
+    );
+  }
+
+  resourceName(resourceId: string): string {
+    return this.changes()
+      .flatMap((change) => change.resources)
+      .find((resource) => resource.id === resourceId)?.name ?? resourceId;
   }
 
   recordDeviation(): void {
@@ -1149,8 +1541,17 @@ export class ChangeDetailComponent {
   }
 
   stepsBy(change: ChangeRequest): ChangeStep[] {
+    return this.sortSteps(change.steps);
+  }
+
+  displaySteps(): ChangeStep[] {
+    // 已批准及执行中：执行步骤以批准时快照为准，实时勾选状态单独合并。
+    return this.snapshotSteps() ?? this.sortSteps(this.change()?.steps ?? []);
+  }
+
+  private sortSteps(steps: ChangeStep[]): ChangeStep[] {
     const order: ChangeStep['phase'][] = ['prepare', 'execute', 'verify', 'rollback'];
-    return [...change.steps].sort((left, right) => {
+    return [...steps].sort((left, right) => {
       const phase = order.indexOf(left.phase) - order.indexOf(right.phase);
       return phase || left.id.localeCompare(right.id);
     });
@@ -1186,6 +1587,7 @@ export class ChangeDetailComponent {
       approved: '已批准',
       rejected: '已退回',
       frozen: '已冻结',
+      invalidated: '会签失效',
     }[state];
   }
 
@@ -1193,6 +1595,9 @@ export class ChangeDetailComponent {
     const item = this.change();
     if (!item) {
       return '-';
+    }
+    if (item.status === 'pending_review') {
+      return '会签已失效，待复核重签';
     }
     if (item.status === 'approved') {
       return '已批准，等待执行';

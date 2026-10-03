@@ -563,14 +563,15 @@ export class NewChangeComponent {
   }
 
   save(submit: boolean): void {
-    const draft = {
+    const draft: ChangeRequest = {
       ...this.draft(),
-      approvals: APPROVAL_ORDER.map((stage) => ({ stage, state: 'pending' as const })),
+      version: 1,
+      status: submit ? 'submitted' : 'draft',
+      approvals: submit
+        ? APPROVAL_ORDER.map((stage) => ({ stage, state: 'pending' as const }))
+        : this.draft().approvals,
     };
     this.store.dispatch(ChangeRequestActions.createChange({ change: draft }));
-    if (submit) {
-      this.store.dispatch(ChangeRequestActions.submitForReview({ id: draft.id }));
-    }
     void this.router.navigate(['/changes', draft.id]);
   }
 
